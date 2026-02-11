@@ -523,7 +523,7 @@ export namespace SessionPrompt {
       if (
         lastFinished &&
         lastFinished.summary !== true &&
-        (await SessionCompaction.isOverflow({ tokens: lastFinished.tokens, model, messages: msgs }))
+        (await SessionCompaction.isOverflow({ tokens: lastFinished.tokens, model, sessionID, messages: msgs }))
       ) {
         await SessionCompaction.create({
           sessionID,
@@ -542,6 +542,12 @@ export namespace SessionPrompt {
         messages: msgs,
         agent,
         session,
+      })
+
+      const sliding = await SessionCompaction.window({
+        sessionID,
+        messages: msgs,
+        model,
       })
 
       const processor = SessionProcessor.create({
@@ -597,7 +603,7 @@ export namespace SessionPrompt {
         })
       }
 
-      const sessionMessages = clone(msgs)
+      const sessionMessages = clone(sliding.messages)
 
       // Ephemerally wrap queued user messages with a reminder to stay on track
       if (step > 1 && lastFinished) {

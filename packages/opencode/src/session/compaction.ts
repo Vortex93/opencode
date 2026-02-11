@@ -20,7 +20,16 @@ export namespace SessionCompaction {
 
   const DEFAULT_SLIDING_THRESHOLD = 0.6
   const DEFAULT_SUMMARY_THRESHOLD = 1
-  const MIN_KEEP_MESSAGES = 4
+  const MIN_KEEP_MESSAGES = 2
+
+  type SlidingWindow = {
+    messages: MessageV2.WithParts[]
+    removed: number
+    manual: number
+    automatic: number
+    remainingEstimate: number
+    target: number
+  }
 
   function normalizeThreshold(value: number | undefined, fallback: number) {
     if (!Number.isFinite(value)) return fallback
@@ -44,6 +53,62 @@ export namespace SessionCompaction {
     return model.limit.input || context - output
   }
 
+  function manualSlides(session: Session.Info) {
+    const count = session.sliding?.manual ?? 0
+    return Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0
+  }
+
+  async function setManualSlides(sessionID: string, count: number) {
+    const next = Math.max(0, Math.floor(count))
+    await Session.update(sessionID, (draft) => {
+      if (next === 0) {
+        draft.sliding = undefined
+        return
+      }
+      draft.sliding = {
+        manual: next,
+      }
+    })
+  }
+
+  function computeSlidingWindow(input: {
+    messages: MessageV2.WithParts[]
+    model: Provider.Model
+    threshold: number
+    manual: number
+  }): SlidingWindow {
+    const usable = getUsableTokens(input.model)
+    if (usable === 0)
+      return {
+        messages: input.messages,
+        removed: 0,
+        manual: 0,
+        automatic: 0,
+        remainingEstimate: 0,
+        target: 0,
+      }
+
+    const target = Math.floor(usable * input.threshold)
+    const maxRemovable = Math.max(0, input.messages.length - MIN_KEEP_MESSAGES)
+    const manual = Math.min(Math.max(0, Math.floor(input.manual)), maxRemovable)
+    let removed = manual
+    let total = estimateMessagesTokens(input.messages.slice(removed))
+
+    while (removed < maxRemovable && total > target) {
+      total -= estimateMessageTokens(input.messages[removed])
+      removed += 1
+    }
+
+    return {
+      messages: input.messages.slice(removed),
+      removed,
+      manual,
+      automatic: removed - manual,
+      remainingEstimate: total,
+      target,
+    }
+  }
+
   export const Event = {
     Compacted: BusEvent.define(
       "session.compacted",
@@ -56,6 +121,7 @@ export namespace SessionCompaction {
   export async function isOverflow(input: {
     tokens: MessageV2.Assistant["tokens"]
     model: Provider.Model
+    sessionID?: string
     messages?: MessageV2.WithParts[]
   }) {
     const { config, mode, threshold } = await getCompactionSettings()
@@ -63,9 +129,15 @@ export namespace SessionCompaction {
     const usable = getUsableTokens(input.model)
     if (usable === 0) return false
     if (mode === "sliding") {
-      if (!input.messages) return false
-      const total = estimateMessagesTokens(input.messages)
-      return total > usable * threshold
+      if (!input.messages || !input.sessionID) return false
+      const session = await Session.get(input.sessionID)
+      const result = computeSlidingWindow({
+        messages: input.messages,
+        model: input.model,
+        threshold,
+        manual: manualSlides(session),
+      })
+      return result.remainingEstimate > result.target
     }
     const count = input.tokens.input + input.tokens.cache.read + input.tokens.output
     return count > usable * threshold
@@ -121,6 +193,59 @@ export namespace SessionCompaction {
       log.info("pruned", { count: toPrune.length })
     }
   }
+
+  export async function window(input: {
+    sessionID: string
+    messages: MessageV2.WithParts[]
+    model: Provider.Model
+  }) {
+    const { mode, threshold } = await getCompactionSettings()
+    const session = await Session.get(input.sessionID)
+    const manual = manualSlides(session)
+    if (mode !== "sliding") {
+      const maxRemovable = Math.max(0, input.messages.length - MIN_KEEP_MESSAGES)
+      const removed = Math.min(manual, maxRemovable)
+      const messages = input.messages.slice(removed)
+      const usable = getUsableTokens(input.model)
+      const target = usable === 0 ? 0 : Math.floor(usable * threshold)
+      return {
+        messages,
+        removed,
+        manual: removed,
+        automatic: 0,
+        remainingEstimate: estimateMessagesTokens(messages),
+        target,
+      }
+    }
+    return computeSlidingWindow({
+      messages: input.messages,
+      model: input.model,
+      threshold,
+      manual,
+    })
+  }
+
+  export const slide = fn(
+    z.object({
+      sessionID: Identifier.schema("session"),
+      count: z.number().int().positive().optional().default(1),
+    }),
+    async (input) => {
+      const session = await Session.get(input.sessionID)
+      const current = manualSlides(session)
+      const messages = await Session.messages({ sessionID: input.sessionID })
+      const maxRemovable = Math.max(0, messages.length - MIN_KEEP_MESSAGES)
+      const next = Math.min(maxRemovable, current + input.count)
+      if (next !== current) {
+        await setManualSlides(input.sessionID, next)
+      }
+      Bus.publish(Event.Compacted, { sessionID: input.sessionID })
+      return {
+        removed: next - current,
+        manual: next,
+      }
+    },
+  )
 
   export async function process(input: {
     parentID: string
@@ -205,34 +330,16 @@ export namespace SessionCompaction {
     threshold: number
     removeMessageID?: string
   }) {
-    const usable = getUsableTokens(input.model)
-    if (usable === 0) return { removed: 0, remainingEstimate: 0, target: 0 }
-    const target = Math.floor(usable * input.threshold)
-
+    const session = await Session.get(input.sessionID)
     const messages = input.removeMessageID
       ? input.messages.filter((msg) => msg.info.id !== input.removeMessageID)
       : input.messages
-    let total = estimateMessagesTokens(messages)
-    const maxRemovable = Math.max(0, messages.length - MIN_KEEP_MESSAGES)
-    let removeCount = 0
-    while (removeCount < maxRemovable && total > target) {
-      total -= estimateMessageTokens(messages[removeCount])
-      removeCount += 1
-    }
-
-    const toRemove = messages.slice(0, removeCount)
-    for (const msg of toRemove) {
-      await removeMessageWithParts(msg)
-    }
-
-    if (input.removeMessageID) {
-      const compactionMessage = input.messages.find((msg) => msg.info.id === input.removeMessageID)
-      if (compactionMessage) {
-        await removeMessageWithParts(compactionMessage)
-      }
-    }
-
-    return { removed: toRemove.length, remainingEstimate: total, target }
+    return computeSlidingWindow({
+      messages,
+      model: input.model,
+      threshold: input.threshold,
+      manual: manualSlides(session),
+    })
   }
 
   async function processSliding(input: {
@@ -260,8 +367,19 @@ export namespace SessionCompaction {
       removeMessageID: input.parentID,
     })
 
+    if (!input.auto) {
+      await setManualSlides(input.sessionID, result.removed)
+    }
+
+    const compactionMessage = input.messages.find((msg) => msg.info.id === input.parentID)
+    if (compactionMessage && compactionMessage.parts.some((part) => part.type === "compaction")) {
+      await removeMessageWithParts(compactionMessage)
+    }
+
     log.info("sliding", {
       removed: result.removed,
+      manual: result.manual,
+      automatic: result.automatic,
       remainingEstimate: result.remainingEstimate,
       target: result.target,
     })
@@ -395,8 +513,13 @@ export namespace SessionCompaction {
           model,
           threshold,
         })
+        if (!input.auto) {
+          await setManualSlides(input.sessionID, result.removed)
+        }
         log.info("sliding", {
           removed: result.removed,
+          manual: result.manual,
+          automatic: result.automatic,
           remainingEstimate: result.remainingEstimate,
           target: result.target,
         })

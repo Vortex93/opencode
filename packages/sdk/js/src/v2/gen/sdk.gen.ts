@@ -127,6 +127,8 @@ import type {
   SessionShareResponses,
   SessionShellErrors,
   SessionShellResponses,
+  SessionSlideErrors,
+  SessionSlideResponses,
   SessionStatusErrors,
   SessionStatusResponses,
   SessionSummarizeErrors,
@@ -1412,6 +1414,43 @@ export class Session extends HeyApiClient {
     )
     return (options?.client ?? this.client).post<SessionSummarizeResponses, SessionSummarizeErrors, ThrowOnError>({
       url: "/session/{sessionID}/summarize",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Slide session context
+   *
+   * Manually remove the oldest message(s) from the active model context window.
+   */
+  public slide<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      count?: number
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "body", key: "count" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SessionSlideResponses, SessionSlideErrors, ThrowOnError>({
+      url: "/session/{sessionID}/slide",
       ...options,
       ...params,
       headers: {

@@ -423,6 +423,31 @@ export function Session() {
       },
     },
     {
+      title: "Slide session context",
+      value: "session.slide",
+      category: "Session",
+      slash: {
+        name: "slide",
+      },
+      onSelect: async (dialog) => {
+        await sdk.client.session
+          .slide({
+            sessionID: route.sessionID,
+            count: 1,
+          })
+          .then((result) => {
+            const removed = result.data?.removed ?? 0
+            if (removed > 0) {
+              toast.show({ message: "Removed oldest message from active context", variant: "success" })
+              return
+            }
+            toast.show({ message: "No older messages left to slide", variant: "warning" })
+          })
+          .catch(() => toast.show({ message: "Failed to slide session context", variant: "error" }))
+        dialog.clear()
+      },
+    },
+    {
       title: "Unshare session",
       value: "session.unshare",
       keybind: "session_unshare",

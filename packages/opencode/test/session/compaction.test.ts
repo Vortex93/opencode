@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test"
-import path from "path"
 import { SessionCompaction } from "../../src/session/compaction"
 import { Token } from "../../src/util/token"
 import { Instance } from "../../src/project/instance"
 import { Log } from "../../src/util/log"
 import { tmpdir } from "../fixture/fixture"
 import { Session } from "../../src/session"
+import { MessageV2 } from "../../src/session/message-v2"
 import type { Provider } from "../../src/provider/provider"
 
 Log.init({ print: false })
@@ -39,9 +39,77 @@ function createModel(opts: {
   } as Provider.Model
 }
 
+function createTextMessage(input: {
+  sessionID: string
+  messageID: string
+  role: "user" | "assistant"
+  text: string
+}): MessageV2.WithParts {
+  if (input.role === "user") {
+    return {
+      info: {
+        id: input.messageID,
+        sessionID: input.sessionID,
+        role: "user",
+        time: { created: Date.now() },
+        agent: "build",
+        model: {
+          providerID: "test",
+          modelID: "test-model",
+        },
+      },
+      parts: [
+        {
+          id: `part-${input.messageID}`,
+          sessionID: input.sessionID,
+          messageID: input.messageID,
+          type: "text",
+          text: input.text,
+        },
+      ],
+    }
+  }
+
+  return {
+    info: {
+      id: input.messageID,
+      sessionID: input.sessionID,
+      role: "assistant",
+      parentID: "parent",
+      modelID: "test-model",
+      providerID: "test",
+      mode: "build",
+      agent: "build",
+      path: {
+        cwd: "/tmp",
+        root: "/tmp",
+      },
+      cost: 0,
+      tokens: {
+        input: 0,
+        output: 0,
+        reasoning: 0,
+        cache: { read: 0, write: 0 },
+      },
+      time: {
+        created: Date.now(),
+      },
+    },
+    parts: [
+      {
+        id: `part-${input.messageID}`,
+        sessionID: input.sessionID,
+        messageID: input.messageID,
+        type: "text",
+        text: input.text,
+      },
+    ],
+  }
+}
+
 describe("session.compaction.isOverflow", () => {
   test("returns true when token count exceeds usable context", async () => {
-    await using tmp = await tmpdir()
+    await using tmp = await tmpdir({ config: { compaction: { mode: "summarize" } } })
     await Instance.provide({
       directory: tmp.path,
       fn: async () => {
@@ -53,7 +121,7 @@ describe("session.compaction.isOverflow", () => {
   })
 
   test("returns false when token count within usable context", async () => {
-    await using tmp = await tmpdir()
+    await using tmp = await tmpdir({ config: { compaction: { mode: "summarize" } } })
     await Instance.provide({
       directory: tmp.path,
       fn: async () => {
@@ -65,7 +133,7 @@ describe("session.compaction.isOverflow", () => {
   })
 
   test("includes cache.read in token count", async () => {
-    await using tmp = await tmpdir()
+    await using tmp = await tmpdir({ config: { compaction: { mode: "summarize" } } })
     await Instance.provide({
       directory: tmp.path,
       fn: async () => {
@@ -77,7 +145,7 @@ describe("session.compaction.isOverflow", () => {
   })
 
   test("respects input limit for input caps", async () => {
-    await using tmp = await tmpdir()
+    await using tmp = await tmpdir({ config: { compaction: { mode: "summarize" } } })
     await Instance.provide({
       directory: tmp.path,
       fn: async () => {
@@ -89,7 +157,7 @@ describe("session.compaction.isOverflow", () => {
   })
 
   test("returns false when input/output are within input caps", async () => {
-    await using tmp = await tmpdir()
+    await using tmp = await tmpdir({ config: { compaction: { mode: "summarize" } } })
     await Instance.provide({
       directory: tmp.path,
       fn: async () => {
@@ -101,7 +169,7 @@ describe("session.compaction.isOverflow", () => {
   })
 
   test("returns false when output within limit with input caps", async () => {
-    await using tmp = await tmpdir()
+    await using tmp = await tmpdir({ config: { compaction: { mode: "summarize" } } })
     await Instance.provide({
       directory: tmp.path,
       fn: async () => {
@@ -113,7 +181,7 @@ describe("session.compaction.isOverflow", () => {
   })
 
   test("returns false when model context limit is 0", async () => {
-    await using tmp = await tmpdir()
+    await using tmp = await tmpdir({ config: { compaction: { mode: "summarize" } } })
     await Instance.provide({
       directory: tmp.path,
       fn: async () => {
@@ -125,22 +193,79 @@ describe("session.compaction.isOverflow", () => {
   })
 
   test("returns false when compaction.auto is disabled", async () => {
-    await using tmp = await tmpdir({
-      init: async (dir) => {
-        await Bun.write(
-          path.join(dir, "opencode.json"),
-          JSON.stringify({
-            compaction: { auto: false },
-          }),
-        )
-      },
-    })
+    await using tmp = await tmpdir({ config: { compaction: { mode: "summarize", auto: false } } })
     await Instance.provide({
       directory: tmp.path,
       fn: async () => {
         const model = createModel({ context: 100_000, output: 32_000 })
         const tokens = { input: 75_000, output: 5_000, reasoning: 0, cache: { read: 0, write: 0 } }
         expect(await SessionCompaction.isOverflow({ tokens, model })).toBe(false)
+      },
+    })
+  })
+})
+
+describe("session.compaction.window", () => {
+  test("restores full history when switching back to larger model", async () => {
+    await using tmp = await tmpdir({ config: { compaction: { mode: "sliding" } } })
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const session = await Session.create({})
+        const messages = [
+          createTextMessage({ sessionID: session.id, messageID: "msg-1", role: "user", text: "a".repeat(160) }),
+          createTextMessage({ sessionID: session.id, messageID: "msg-2", role: "assistant", text: "b".repeat(160) }),
+          createTextMessage({ sessionID: session.id, messageID: "msg-3", role: "user", text: "c".repeat(160) }),
+          createTextMessage({ sessionID: session.id, messageID: "msg-4", role: "assistant", text: "d".repeat(160) }),
+        ]
+
+        const large = createModel({ context: 1_200, output: 200 })
+        const small = createModel({ context: 400, output: 200 })
+
+        const full = await SessionCompaction.window({ sessionID: session.id, messages, model: large })
+        expect(full.removed).toBe(0)
+
+        const compacted = await SessionCompaction.window({ sessionID: session.id, messages, model: small })
+        expect(compacted.removed).toBeGreaterThan(0)
+
+        const restored = await SessionCompaction.window({ sessionID: session.id, messages, model: large })
+        expect(restored.removed).toBe(0)
+      },
+    })
+  })
+
+  test("manual /slide state trims context without deleting stored messages", async () => {
+    await using tmp = await tmpdir({ config: { compaction: { mode: "sliding" } } })
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const session = await Session.create({})
+        const messages = [
+          createTextMessage({ sessionID: session.id, messageID: "msg-10", role: "user", text: "x".repeat(160) }),
+          createTextMessage({ sessionID: session.id, messageID: "msg-20", role: "assistant", text: "y".repeat(160) }),
+          createTextMessage({ sessionID: session.id, messageID: "msg-30", role: "user", text: "z".repeat(160) }),
+        ]
+
+        for (const msg of messages) {
+          await Session.updateMessage(msg.info)
+          for (const part of msg.parts) {
+            await Session.updatePart(part)
+          }
+        }
+
+        const model = createModel({ context: 1_200, output: 200 })
+        const before = await SessionCompaction.window({ sessionID: session.id, messages, model })
+        expect(before.removed).toBe(0)
+
+        const slid = await SessionCompaction.slide({ sessionID: session.id, count: 1 })
+        expect(slid.removed).toBe(1)
+        expect(slid.manual).toBe(1)
+
+        const after = await SessionCompaction.window({ sessionID: session.id, messages, model })
+        expect(after.removed).toBe(1)
+
+        const stored = await Session.messages({ sessionID: session.id })
+        expect(stored.length).toBe(messages.length)
       },
     })
   })

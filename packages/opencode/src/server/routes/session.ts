@@ -543,6 +543,51 @@ export const SessionRoutes = lazy(() =>
         return c.json(true)
       },
     )
+    .post(
+      "/:sessionID/slide",
+      describeRoute({
+        summary: "Slide session context",
+        description: "Manually remove the oldest message(s) from the active model context window.",
+        operationId: "session.slide",
+        responses: {
+          200: {
+            description: "Slid session context",
+            content: {
+              "application/json": {
+                schema: resolver(
+                  z.object({
+                    removed: z.number().int(),
+                    manual: z.number().int(),
+                  }),
+                ),
+              },
+            },
+          },
+          ...errors(400, 404),
+        },
+      }),
+      validator(
+        "param",
+        z.object({
+          sessionID: z.string().meta({ description: "Session ID" }),
+        }),
+      ),
+      validator(
+        "json",
+        z.object({
+          count: z.number().int().positive().optional().default(1),
+        }),
+      ),
+      async (c) => {
+        const sessionID = c.req.valid("param").sessionID
+        const body = c.req.valid("json")
+        const result = await SessionCompaction.slide({
+          sessionID,
+          count: body.count,
+        })
+        return c.json(result)
+      },
+    )
     .get(
       "/:sessionID/message",
       describeRoute({

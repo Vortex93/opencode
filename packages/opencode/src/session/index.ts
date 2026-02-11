@@ -69,6 +69,11 @@ export namespace Session {
           url: z.string(),
         })
         .optional(),
+      sliding: z
+        .object({
+          manual: z.number().int().min(0).optional(),
+        })
+        .optional(),
       title: z.string(),
       version: z.string(),
       time: z.object({

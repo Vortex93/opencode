@@ -696,6 +696,7 @@ export type EventTuiCommandExecute = {
       | "session.share"
       | "session.interrupt"
       | "session.compact"
+      | "session.slide"
       | "session.page.up"
       | "session.page.down"
       | "session.line.up"
@@ -783,6 +784,9 @@ export type Session = {
   }
   share?: {
     url: string
+  }
+  sliding?: {
+    manual?: number
   }
   title: string
   version: string
@@ -1814,6 +1818,14 @@ export type Config = {
     url?: string
   }
   compaction?: {
+    /**
+     * Compaction strategy (default: sliding)
+     */
+    mode?: "summarize" | "sliding"
+    /**
+     * Context usage ratio to trigger compaction (default: 0.6 for sliding, 1.0 for summarize)
+     */
+    threshold?: number
     /**
      * Enable automatic compaction when context is full (default: true)
      */
@@ -3340,6 +3352,47 @@ export type SessionSummarizeResponses = {
 }
 
 export type SessionSummarizeResponse = SessionSummarizeResponses[keyof SessionSummarizeResponses]
+
+export type SessionSlideData = {
+  body?: {
+    count?: number
+  }
+  path: {
+    /**
+     * Session ID
+     */
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+  }
+  url: "/session/{sessionID}/slide"
+}
+
+export type SessionSlideErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * Not found
+   */
+  404: NotFoundError
+}
+
+export type SessionSlideError = SessionSlideErrors[keyof SessionSlideErrors]
+
+export type SessionSlideResponses = {
+  /**
+   * Slid session context
+   */
+  200: {
+    removed: number
+    manual: number
+  }
+}
+
+export type SessionSlideResponse = SessionSlideResponses[keyof SessionSlideResponses]
 
 export type SessionMessagesData = {
   body?: never
