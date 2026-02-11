@@ -172,7 +172,7 @@ export namespace SessionCompaction {
       case "agent":
         return Token.estimate(part.name)
       case "retry":
-        return Token.estimate(part.error.message)
+        return Token.estimate(part.error.data.message)
       case "compaction":
       case "snapshot":
       case "step-start":
