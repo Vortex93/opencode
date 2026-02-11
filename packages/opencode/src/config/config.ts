@@ -1159,14 +1159,15 @@ export namespace Config {
         .optional(),
       compaction: z
         .object({
+          mode: z.enum(["summarize", "sliding"]).optional().describe("Compaction strategy (default: sliding)"),
+          threshold: z
+            .number()
+            .min(0)
+            .max(1)
+            .optional()
+            .describe("Context usage ratio to trigger compaction (default: 0.6 for sliding, 1.0 for summarize)"),
           auto: z.boolean().optional().describe("Enable automatic compaction when context is full (default: true)"),
           prune: z.boolean().optional().describe("Enable pruning of old tool outputs (default: true)"),
-          reserved: z
-            .number()
-            .int()
-            .min(0)
-            .optional()
-            .describe("Token buffer for compaction. Leaves enough window to avoid overflow during compaction."),
         })
         .optional(),
       experimental: z

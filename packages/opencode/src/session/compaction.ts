@@ -6,6 +6,7 @@ import { Instance } from "../project/instance"
 import { Provider } from "../provider/provider"
 import { MessageV2 } from "./message-v2"
 import z from "zod"
+import { SessionPrompt } from "./prompt"
 import { Token } from "../util/token"
 import { Log } from "../util/log"
 import { SessionProcessor } from "./processor"
@@ -13,10 +14,35 @@ import { fn } from "@/util/fn"
 import { Agent } from "@/agent/agent"
 import { Plugin } from "@/plugin"
 import { Config } from "@/config/config"
-import { ProviderTransform } from "@/provider/transform"
 
 export namespace SessionCompaction {
   const log = Log.create({ service: "session.compaction" })
+
+  const DEFAULT_SLIDING_THRESHOLD = 0.6
+  const DEFAULT_SUMMARY_THRESHOLD = 1
+  const MIN_KEEP_MESSAGES = 4
+
+  function normalizeThreshold(value: number | undefined, fallback: number) {
+    if (!Number.isFinite(value)) return fallback
+    const threshold = value ?? fallback
+    if (threshold <= 0) return fallback
+    return Math.min(1, Math.max(0.1, threshold))
+  }
+
+  async function getCompactionSettings() {
+    const config = await Config.get()
+    const mode = config.compaction?.mode ?? "sliding"
+    const fallback = mode === "sliding" ? DEFAULT_SLIDING_THRESHOLD : DEFAULT_SUMMARY_THRESHOLD
+    const threshold = normalizeThreshold(config.compaction?.threshold, fallback)
+    return { config, mode, threshold }
+  }
+
+  function getUsableTokens(model: Provider.Model) {
+    const context = model.limit.context
+    if (context === 0) return 0
+    const output = Math.min(model.limit.output, SessionPrompt.OUTPUT_TOKEN_MAX) || SessionPrompt.OUTPUT_TOKEN_MAX
+    return model.limit.input || context - output
+  }
 
   export const Event = {
     Compacted: BusEvent.define(
@@ -27,22 +53,22 @@ export namespace SessionCompaction {
     ),
   }
 
-  const COMPACTION_BUFFER = 20_000
-
-  export async function isOverflow(input: { tokens: MessageV2.Assistant["tokens"]; model: Provider.Model }) {
-    const config = await Config.get()
+  export async function isOverflow(input: {
+    tokens: MessageV2.Assistant["tokens"]
+    model: Provider.Model
+    messages?: MessageV2.WithParts[]
+  }) {
+    const { config, mode, threshold } = await getCompactionSettings()
     if (config.compaction?.auto === false) return false
-    const context = input.model.limit.context
-    if (context === 0) return false
-
-    const count =
-      input.tokens.total ||
-      input.tokens.input + input.tokens.output + input.tokens.cache.read + input.tokens.cache.write
-
-    const reserved =
-      config.compaction?.reserved ?? Math.min(COMPACTION_BUFFER, ProviderTransform.maxOutputTokens(input.model))
-    const usable = input.model.limit.input ? input.model.limit.input - reserved : context - reserved
-    return count >= usable
+    const usable = getUsableTokens(input.model)
+    if (usable === 0) return false
+    if (mode === "sliding") {
+      if (!input.messages) return false
+      const total = estimateMessagesTokens(input.messages)
+      return total > usable * threshold
+    }
+    const count = input.tokens.input + input.tokens.cache.read + input.tokens.output
+    return count > usable * threshold
   }
 
   export const PRUNE_MINIMUM = 20_000
@@ -103,6 +129,153 @@ export namespace SessionCompaction {
     abort: AbortSignal
     auto: boolean
   }) {
+    const { mode } = await getCompactionSettings()
+    if (mode === "sliding") {
+      return processSliding(input)
+    }
+    return processSummarize(input)
+  }
+
+  async function removeMessageWithParts(message: MessageV2.WithParts) {
+    for (const part of message.parts) {
+      await Session.removePart({
+        sessionID: message.info.sessionID,
+        messageID: message.info.id,
+        partID: part.id,
+      })
+    }
+    await Session.removeMessage({
+      sessionID: message.info.sessionID,
+      messageID: message.info.id,
+    })
+  }
+
+  function estimatePartTokens(part: MessageV2.Part) {
+    switch (part.type) {
+      case "text":
+      case "reasoning":
+        return Token.estimate(part.text)
+      case "tool": {
+        const input = Token.estimate(JSON.stringify(part.state.input ?? {}))
+        if (part.state.status === "completed") return input + Token.estimate(part.state.output)
+        if (part.state.status === "error") return input + Token.estimate(part.state.error)
+        return input
+      }
+      case "file":
+        if (part.source?.text?.value) return Token.estimate(part.source.text.value)
+        if (part.filename) return Token.estimate(part.filename)
+        return Token.estimate(part.url)
+      case "patch":
+        return Token.estimate(part.files.join(" "))
+      case "subtask":
+        return Token.estimate(`${part.prompt}\n${part.description}`)
+      case "agent":
+        return Token.estimate(part.name)
+      case "retry":
+        return Token.estimate(part.error.message)
+      case "compaction":
+      case "snapshot":
+      case "step-start":
+      case "step-finish":
+        return 0
+      default:
+        return 0
+    }
+  }
+
+  function estimateMessageTokens(message: MessageV2.WithParts) {
+    let total = 0
+    if (message.info.role === "user" && message.info.system) {
+      total += Token.estimate(message.info.system)
+    }
+    for (const part of message.parts) {
+      total += estimatePartTokens(part)
+    }
+    return total
+  }
+
+  function estimateMessagesTokens(messages: MessageV2.WithParts[]) {
+    return messages.reduce((sum, msg) => sum + estimateMessageTokens(msg), 0)
+  }
+
+  async function slideSession(input: {
+    sessionID: string
+    messages: MessageV2.WithParts[]
+    model: Provider.Model
+    threshold: number
+    removeMessageID?: string
+  }) {
+    const usable = getUsableTokens(input.model)
+    if (usable === 0) return { removed: 0, remainingEstimate: 0, target: 0 }
+    const target = Math.floor(usable * input.threshold)
+
+    const messages = input.removeMessageID
+      ? input.messages.filter((msg) => msg.info.id !== input.removeMessageID)
+      : input.messages
+    let total = estimateMessagesTokens(messages)
+    const maxRemovable = Math.max(0, messages.length - MIN_KEEP_MESSAGES)
+    let removeCount = 0
+    while (removeCount < maxRemovable && total > target) {
+      total -= estimateMessageTokens(messages[removeCount])
+      removeCount += 1
+    }
+
+    const toRemove = messages.slice(0, removeCount)
+    for (const msg of toRemove) {
+      await removeMessageWithParts(msg)
+    }
+
+    if (input.removeMessageID) {
+      const compactionMessage = input.messages.find((msg) => msg.info.id === input.removeMessageID)
+      if (compactionMessage) {
+        await removeMessageWithParts(compactionMessage)
+      }
+    }
+
+    return { removed: toRemove.length, remainingEstimate: total, target }
+  }
+
+  async function processSliding(input: {
+    parentID: string
+    messages: MessageV2.WithParts[]
+    sessionID: string
+    abort: AbortSignal
+    auto: boolean
+  }) {
+    const { config, threshold } = await getCompactionSettings()
+    if (config.compaction?.auto === false && input.auto) return "continue"
+    const userMessage = input.messages.findLast((m) => m.info.id === input.parentID)?.info as MessageV2.User
+    if (!userMessage) return "continue"
+
+    const agent = await Agent.get("compaction")
+    const model = agent.model
+      ? await Provider.getModel(agent.model.providerID, agent.model.modelID)
+      : await Provider.getModel(userMessage.model.providerID, userMessage.model.modelID)
+
+    const result = await slideSession({
+      sessionID: input.sessionID,
+      messages: input.messages,
+      model,
+      threshold,
+      removeMessageID: input.parentID,
+    })
+
+    log.info("sliding", {
+      removed: result.removed,
+      remainingEstimate: result.remainingEstimate,
+      target: result.target,
+    })
+    Bus.publish(Event.Compacted, { sessionID: input.sessionID })
+    return "continue"
+  }
+
+  async function processSummarize(input: {
+    parentID: string
+    messages: MessageV2.WithParts[]
+    sessionID: string
+    abort: AbortSignal
+    auto: boolean
+  }) {
     const userMessage = input.messages.findLast((m) => m.info.id === input.parentID)!.info as MessageV2.User
     const agent = await Agent.get("compaction")
     const model = agent.model
@@ -146,34 +319,8 @@ export namespace SessionCompaction {
       { sessionID: input.sessionID },
       { context: [], prompt: undefined },
     )
-    const defaultPrompt = `Provide a detailed prompt for continuing our conversation above.
-Focus on information that would be helpful for continuing the conversation, including what we did, what we're doing, which files we're working on, and what we're going to do next.
-The summary that you construct will be used so that another agent can read it and continue the work.
-
-When constructing the summary, try to stick to this template:
----
-## Goal
-
-[What goal(s) is the user trying to accomplish?]
-
-## Instructions
-
-- [What important instructions did the user give you that are relevant]
-- [If there is a plan or spec, include information about it so next agent can continue using it]
-
-## Discoveries
-
-[What notable things were learned during this conversation that would be useful for the next agent to know when continuing the work]
-
-## Accomplished
-
-[What work has been completed, what work is still in progress, and what work is left?]
-
-## Relevant files / directories
-
-[Construct a structured list of relevant files that have been read, edited, or created that pertain to the task at hand. If all the files in a directory are relevant, include the path to the directory.]
----`
-
+    const defaultPrompt =
+      "Provide a detailed prompt for continuing our conversation above. Focus on information that would be helpful for continuing the conversation, including what we did, what we're doing, which files we're working on, and what we're going to do next considering new session will not have access to our conversation."
     const promptText = compacting.prompt ?? [defaultPrompt, ...compacting.context].join("\n\n")
     const result = await processor.process({
       user: userMessage,
@@ -214,7 +361,7 @@ When constructing the summary, try to stick to this template:
         sessionID: input.sessionID,
         type: "text",
         synthetic: true,
-        text: "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
+        text: "Continue if you have next steps",
         time: {
           start: Date.now(),
           end: Date.now(),
@@ -237,6 +384,25 @@ When constructing the summary, try to stick to this template:
       auto: z.boolean(),
     }),
     async (input) => {
+      const { config, mode, threshold } = await getCompactionSettings()
+      if (mode === "sliding") {
+        if (config.compaction?.auto === false && input.auto) return
+        const model = await Provider.getModel(input.model.providerID, input.model.modelID)
+        const messages = await Session.messages({ sessionID: input.sessionID })
+        const result = await slideSession({
+          sessionID: input.sessionID,
+          messages,
+          model,
+          threshold,
+        })
+        log.info("sliding", {
+          removed: result.removed,
+          remainingEstimate: result.remainingEstimate,
+          target: result.target,
+        })
+        Bus.publish(Event.Compacted, { sessionID: input.sessionID })
+        return
+      }
       const msg = await Session.updateMessage({
         id: Identifier.ascending("message"),
         role: "user",
