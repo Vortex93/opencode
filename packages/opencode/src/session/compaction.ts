@@ -20,7 +20,6 @@ export namespace SessionCompaction {
   const log = Log.create({ service: "session.compaction" })
 
   const DEFAULT_SLIDING_THRESHOLD = 0.6
-  const DEFAULT_SUMMARY_THRESHOLD = 1
   const MIN_KEEP_MESSAGES = 2
 
   type SlidingWindow = {
@@ -35,6 +34,7 @@ export namespace SessionCompaction {
   type SlidingState = {
     manual?: number
     threshold?: number
+    mode?: "sliding" | "compaction"
   }
 
   function normalizeThreshold(value: number | undefined, fallback: number) {
@@ -46,8 +46,8 @@ export namespace SessionCompaction {
 
   async function getCompactionSettings() {
     const config = await Config.get()
-    const mode = config.compaction?.mode ?? "sliding"
-    const fallback = mode === "sliding" ? DEFAULT_SLIDING_THRESHOLD : DEFAULT_SUMMARY_THRESHOLD
+    const mode = config.compaction?.mode === "summarize" ? "sliding" : (config.compaction?.mode ?? "sliding")
+    const fallback = DEFAULT_SLIDING_THRESHOLD
     const threshold = normalizeThreshold(config.compaction?.threshold, fallback)
     return { config, mode, threshold }
   }
@@ -65,7 +65,7 @@ export namespace SessionCompaction {
   }
 
   async function setSlidingState(sessionID: string, state: SlidingState) {
-    if (state.manual === undefined && state.threshold === undefined) {
+    if (state.manual === undefined && state.threshold === undefined && state.mode === undefined) {
       await Storage.remove(["session_sliding", sessionID]).catch(() => {})
       return
     }
@@ -82,7 +82,10 @@ export namespace SessionCompaction {
   }
 
   function modeWithSlidingOverride(mode: "summarize" | "sliding", sliding: SlidingState) {
+    if (sliding.mode === "sliding") return "sliding" as const
+    if (sliding.mode === "compaction") return "sliding" as const
     if (sliding.threshold !== undefined) return "sliding" as const
+    if (mode === "summarize") return "sliding" as const
     return mode
   }
 
@@ -269,6 +272,25 @@ export namespace SessionCompaction {
       return {
         percent: threshold * 100,
         threshold,
+      }
+    },
+  )
+
+  export const setMode = fn(
+    z.object({
+      sessionID: Identifier.schema("session"),
+      mode: z.enum(["sliding", "compaction"]),
+    }),
+    async (input) => {
+      await Session.get(input.sessionID)
+      const current = await getSlidingState(input.sessionID)
+      await setSlidingState(input.sessionID, {
+        ...current,
+        mode: "sliding",
+      })
+      Bus.publish(Event.Compacted, { sessionID: input.sessionID })
+      return {
+        mode: "sliding" as const,
       }
     },
   )

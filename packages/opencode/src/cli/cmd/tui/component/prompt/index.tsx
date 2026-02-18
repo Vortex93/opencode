@@ -357,6 +357,23 @@ export function Prompt(props: PromptProps) {
         },
       },
       {
+        title: "Set session context mode",
+        value: "session.mode.set",
+        category: "Session",
+        slash: {
+          name: "mode",
+        },
+        onSelect: (dialog) => {
+          input.setText("/mode ")
+          setStore("prompt", {
+            input: "/mode ",
+            parts: [],
+          })
+          input.gotoBufferEnd()
+          dialog.clear()
+        },
+      },
+      {
         title: "Skills",
         value: "prompt.skills",
         category: "Prompt",
@@ -620,6 +637,76 @@ export function Prompt(props: PromptProps) {
           toast.show({
             variant: "error",
             message: error instanceof Error ? error.message : "Failed to set window",
+            duration: 3000,
+          })
+        })
+      input.extmarks.clear()
+      setStore("prompt", {
+        input: "",
+        parts: [],
+      })
+      setStore("extmarkToPartIndex", new Map())
+      input.clear()
+      return
+    }
+    const modeMatch = trimmed.match(/^\/mode\s+(sliding|compaction)\s*$/i)
+    if (trimmed.toLowerCase().startsWith("/mode") && !modeMatch) {
+      toast.show({
+        variant: "warning",
+        message: "Usage: /mode <sliding|compaction>",
+        duration: 3000,
+      })
+      return
+    }
+    if (modeMatch) {
+      const mode = modeMatch[1].toLowerCase() as "sliding" | "compaction"
+      if (mode === "compaction") {
+        toast.show({
+          variant: "warning",
+          message: "Compaction mode is disabled. Use /mode sliding",
+          duration: 3000,
+        })
+        return
+      }
+      const sessionID = props.sessionID
+        ? props.sessionID
+        : await sdk.client.session.create({}).then((x) => x.data!.id)
+      const headers = new Headers(sdk.headers)
+      headers.set("Content-Type", "application/json")
+      const endpoint = new URL(sdk.url)
+      endpoint.pathname = endpoint.pathname.replace(/\/$/, "") + `/session/${sessionID}/mode`
+      const request = sdk.fetch ?? fetch
+      await request(endpoint, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          mode,
+        }),
+      })
+        .then(async (response) => {
+          if (!response.ok) {
+            const text = await response.text().catch(() => "")
+            throw new Error(text || `mode update failed (${response.status})`)
+          }
+          toast.show({
+            variant: "success",
+            message: `Session mode set to ${mode}`,
+            duration: 3000,
+          })
+        })
+        .then(() => {
+          if (props.sessionID) return
+          setTimeout(() => {
+            route.navigate({
+              type: "session",
+              sessionID,
+            })
+          }, 50)
+        })
+        .catch((error) => {
+          toast.show({
+            variant: "error",
+            message: error instanceof Error ? error.message : "Failed to set mode",
             duration: 3000,
           })
         })

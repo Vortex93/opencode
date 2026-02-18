@@ -419,19 +419,10 @@ export function Session() {
         aliases: ["summarize"],
       },
       onSelect: (dialog) => {
-        const selectedModel = local.model.current()
-        if (!selectedModel) {
-          toast.show({
-            variant: "warning",
-            message: "Connect a provider to summarize this session",
-            duration: 3000,
-          })
-          return
-        }
-        sdk.client.session.summarize({
-          sessionID: route.sessionID,
-          modelID: selectedModel.modelID,
-          providerID: selectedModel.providerID,
+        toast.show({
+          variant: "warning",
+          message: "Compaction mode is disabled. Use /mode sliding",
+          duration: 3000,
         })
         dialog.clear()
       },

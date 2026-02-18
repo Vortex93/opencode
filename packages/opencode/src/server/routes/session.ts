@@ -630,6 +630,50 @@ export const SessionRoutes = lazy(() =>
         return c.json(result)
       },
     )
+    .post(
+      "/:sessionID/mode",
+      describeRoute({
+        summary: "Set session context mode",
+        description: "Set the session context mode. Compaction mode is disabled and sliding is always enforced.",
+        operationId: "session.mode",
+        responses: {
+          200: {
+            description: "Session context mode updated",
+            content: {
+              "application/json": {
+                schema: resolver(
+                  z.object({
+                    mode: z.enum(["sliding"]),
+                  }),
+                ),
+              },
+            },
+          },
+          ...errors(400, 404),
+        },
+      }),
+      validator(
+        "param",
+        z.object({
+          sessionID: z.string().meta({ description: "Session ID" }),
+        }),
+      ),
+      validator(
+        "json",
+        z.object({
+          mode: z.enum(["sliding", "compaction"]),
+        }),
+      ),
+      async (c) => {
+        const sessionID = c.req.valid("param").sessionID
+        const body = c.req.valid("json")
+        const result = await SessionCompaction.setMode({
+          sessionID,
+          mode: body.mode,
+        })
+        return c.json(result)
+      },
+    )
     .get(
       "/:sessionID/message",
       describeRoute({
