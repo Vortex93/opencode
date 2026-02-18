@@ -780,6 +780,7 @@ export namespace Config {
       stash_delete: z.string().optional().default("ctrl+d").describe("Delete stash entry"),
       model_provider_list: z.string().optional().default("ctrl+a").describe("Open provider list from model dialog"),
       model_favorite_toggle: z.string().optional().default("ctrl+f").describe("Toggle model favorite status"),
+      model_show_all_toggle: z.string().optional().default("ctrl+o").describe("Toggle showing all models"),
       session_share: z.string().optional().default("none").describe("Share current session"),
       session_unshare: z.string().optional().default("none").describe("Unshare current session"),
       session_interrupt: z.string().optional().default("escape").describe("Interrupt current session"),
@@ -820,7 +821,12 @@ export namespace Config {
       command_list: z.string().optional().default("ctrl+p").describe("List available commands"),
       agent_list: z.string().optional().default("<leader>a").describe("List agents"),
       agent_cycle: z.string().optional().default("tab").describe("Next agent"),
-      agent_cycle_reverse: z.string().optional().default("shift+tab").describe("Previous agent"),
+      agent_cycle_reverse: z.string().optional().default("none").describe("Previous agent"),
+      permission_auto_accept_toggle: z
+        .string()
+        .optional()
+        .default("shift+tab")
+        .describe("Toggle auto-accept mode for permissions"),
       variant_cycle: z.string().optional().default("ctrl+t").describe("Cycle model variants"),
       input_clear: z.string().optional().default("ctrl+c").describe("Clear input field"),
       input_paste: z.string().optional().default("ctrl+v").describe("Paste from clipboard"),
