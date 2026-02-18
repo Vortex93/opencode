@@ -585,6 +585,51 @@ export const SessionRoutes = lazy(() =>
         return c.json(result)
       },
     )
+    .post(
+      "/:sessionID/window",
+      describeRoute({
+        summary: "Set sliding context window",
+        description: "Set the sliding context window target as a percentage of model input capacity.",
+        operationId: "session.window",
+        responses: {
+          200: {
+            description: "Sliding window updated",
+            content: {
+              "application/json": {
+                schema: resolver(
+                  z.object({
+                    percent: z.number(),
+                    threshold: z.number(),
+                  }),
+                ),
+              },
+            },
+          },
+          ...errors(400, 404),
+        },
+      }),
+      validator(
+        "param",
+        z.object({
+          sessionID: z.string().meta({ description: "Session ID" }),
+        }),
+      ),
+      validator(
+        "json",
+        z.object({
+          percent: z.number().positive().max(100),
+        }),
+      ),
+      async (c) => {
+        const sessionID = c.req.valid("param").sessionID
+        const body = c.req.valid("json")
+        const result = await SessionCompaction.setWindow({
+          sessionID,
+          percent: body.percent,
+        })
+        return c.json(result)
+      },
+    )
     .get(
       "/:sessionID/message",
       describeRoute({

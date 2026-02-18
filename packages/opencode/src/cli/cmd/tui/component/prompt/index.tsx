@@ -340,6 +340,23 @@ export function Prompt(props: PromptProps) {
         },
       },
       {
+        title: "Set sliding context window",
+        value: "session.window.set",
+        category: "Session",
+        slash: {
+          name: "setwindow",
+        },
+        onSelect: (dialog) => {
+          input.setText("/setwindow ")
+          setStore("prompt", {
+            input: "/setwindow ",
+            parts: [],
+          })
+          input.gotoBufferEnd()
+          dialog.clear()
+        },
+      },
+      {
         title: "Skills",
         value: "prompt.skills",
         category: "Prompt",
@@ -542,6 +559,77 @@ export function Prompt(props: PromptProps) {
     const trimmed = store.prompt.input.trim()
     if (trimmed === "exit" || trimmed === "quit" || trimmed === ":q") {
       exit()
+      return
+    }
+    const windowMatch = trimmed.match(/^\/setwindow\s+([0-9]+(?:\.[0-9]+)?)\s*%?$/i)
+    if (trimmed.toLowerCase().startsWith("/setwindow") && !windowMatch) {
+      toast.show({
+        variant: "warning",
+        message: "Usage: /setwindow <percent>",
+        duration: 3000,
+      })
+      return
+    }
+    if (windowMatch) {
+      const raw = Number(windowMatch[1])
+      if (!Number.isFinite(raw) || raw <= 0 || raw > 100) {
+        toast.show({
+          variant: "warning",
+          message: "Window must be between 0 and 100 percent",
+          duration: 3000,
+        })
+        return
+      }
+      const sessionID = props.sessionID
+        ? props.sessionID
+        : await sdk.client.session.create({}).then((x) => x.data!.id)
+      const headers = new Headers(sdk.headers)
+      headers.set("Content-Type", "application/json")
+      const endpoint = new URL(sdk.url)
+      endpoint.pathname = endpoint.pathname.replace(/\/$/, "") + `/session/${sessionID}/window`
+      const request = sdk.fetch ?? fetch
+      await request(endpoint, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          percent: raw,
+        }),
+      })
+        .then(async (response) => {
+          if (!response.ok) {
+            const text = await response.text().catch(() => "")
+            throw new Error(text || `window update failed (${response.status})`)
+          }
+          const body = (await response.json()) as { percent?: number }
+          toast.show({
+            variant: "success",
+            message: `Sliding window set to ${body.percent ?? raw}%`,
+            duration: 3000,
+          })
+        })
+        .then(() => {
+          if (props.sessionID) return
+          setTimeout(() => {
+            route.navigate({
+              type: "session",
+              sessionID,
+            })
+          }, 50)
+        })
+        .catch((error) => {
+          toast.show({
+            variant: "error",
+            message: error instanceof Error ? error.message : "Failed to set window",
+            duration: 3000,
+          })
+        })
+      input.extmarks.clear()
+      setStore("prompt", {
+        input: "",
+        parts: [],
+      })
+      setStore("extmarkToPartIndex", new Map())
+      input.clear()
       return
     }
     const selectedModel = local.model.current()

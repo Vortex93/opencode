@@ -1,0 +1,10 @@
+version: '3'
+
+tasks:
+  install:
+    desc: Build and install opencode binary
+    dir: packages/opencode
+    cmds:
+      - bun run build
+      - cp "dist/opencode-linux-x64/bin/opencode" "$HOME/.opencode/bin/opencode.new" && chmod +x "$HOME/.opencode/bin/opencode.new" && mv -f "$HOME/.opencode/bin/opencode.new" "$HOME/.opencode/bin/opencode"
+      - git -C ../.. checkout -- bun.lock

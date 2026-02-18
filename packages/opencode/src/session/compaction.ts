@@ -14,6 +14,7 @@ import { fn } from "@/util/fn"
 import { Agent } from "@/agent/agent"
 import { Plugin } from "@/plugin"
 import { Config } from "@/config/config"
+import { Storage } from "../storage/storage"
 
 export namespace SessionCompaction {
   const log = Log.create({ service: "session.compaction" })
@@ -29,6 +30,11 @@ export namespace SessionCompaction {
     automatic: number
     remainingEstimate: number
     target: number
+  }
+
+  type SlidingState = {
+    manual?: number
+    threshold?: number
   }
 
   function normalizeThreshold(value: number | undefined, fallback: number) {
@@ -53,21 +59,39 @@ export namespace SessionCompaction {
     return model.limit.input || context - output
   }
 
-  function manualSlides(session: Session.Info) {
-    const count = session.sliding?.manual ?? 0
+  async function getSlidingState(sessionID: string): Promise<SlidingState> {
+    const result = await Storage.read<SlidingState>(["session_sliding", sessionID]).catch(() => undefined)
+    return result ?? {}
+  }
+
+  async function setSlidingState(sessionID: string, state: SlidingState) {
+    if (state.manual === undefined && state.threshold === undefined) {
+      await Storage.remove(["session_sliding", sessionID]).catch(() => {})
+      return
+    }
+    await Storage.write(["session_sliding", sessionID], state)
+  }
+
+  function manualSlides(sliding: SlidingState) {
+    const count = sliding.manual ?? 0
     return Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0
+  }
+
+  function slidingThreshold(sliding: SlidingState, fallback: number) {
+    return normalizeThreshold(sliding.threshold, fallback)
+  }
+
+  function modeWithSlidingOverride(mode: "summarize" | "sliding", sliding: SlidingState) {
+    if (sliding.threshold !== undefined) return "sliding" as const
+    return mode
   }
 
   async function setManualSlides(sessionID: string, count: number) {
     const next = Math.max(0, Math.floor(count))
-    await Session.update(sessionID, (draft) => {
-      if (next === 0) {
-        draft.sliding = undefined
-        return
-      }
-      draft.sliding = {
-        manual: next,
-      }
+    const current = await getSlidingState(sessionID)
+    await setSlidingState(sessionID, {
+      ...current,
+      manual: next === 0 ? undefined : next,
     })
   }
 
@@ -128,14 +152,15 @@ export namespace SessionCompaction {
     if (config.compaction?.auto === false) return false
     const usable = getUsableTokens(input.model)
     if (usable === 0) return false
-    if (mode === "sliding") {
+    const sliding = input.sessionID ? await getSlidingState(input.sessionID) : {}
+    const effectiveMode = modeWithSlidingOverride(mode, sliding)
+    if (effectiveMode === "sliding") {
       if (!input.messages || !input.sessionID) return false
-      const session = await Session.get(input.sessionID)
       const result = computeSlidingWindow({
         messages: input.messages,
         model: input.model,
-        threshold,
-        manual: manualSlides(session),
+        threshold: slidingThreshold(sliding, threshold),
+        manual: manualSlides(sliding),
       })
       return result.remainingEstimate > result.target
     }
@@ -200,14 +225,16 @@ export namespace SessionCompaction {
     model: Provider.Model
   }) {
     const { mode, threshold } = await getCompactionSettings()
-    const session = await Session.get(input.sessionID)
-    const manual = manualSlides(session)
-    if (mode !== "sliding") {
+    const sliding = await getSlidingState(input.sessionID)
+    const effectiveMode = modeWithSlidingOverride(mode, sliding)
+    const manual = manualSlides(sliding)
+    const currentThreshold = slidingThreshold(sliding, threshold)
+    if (effectiveMode !== "sliding") {
       const maxRemovable = Math.max(0, input.messages.length - MIN_KEEP_MESSAGES)
       const removed = Math.min(manual, maxRemovable)
       const messages = input.messages.slice(removed)
       const usable = getUsableTokens(input.model)
-      const target = usable === 0 ? 0 : Math.floor(usable * threshold)
+      const target = usable === 0 ? 0 : Math.floor(usable * currentThreshold)
       return {
         messages,
         removed,
@@ -220,10 +247,31 @@ export namespace SessionCompaction {
     return computeSlidingWindow({
       messages: input.messages,
       model: input.model,
-      threshold,
+      threshold: currentThreshold,
       manual,
     })
   }
+
+  export const setWindow = fn(
+    z.object({
+      sessionID: Identifier.schema("session"),
+      percent: z.number().positive().max(100),
+    }),
+    async (input) => {
+      await Session.get(input.sessionID)
+      const current = await getSlidingState(input.sessionID)
+      const threshold = Math.min(1, Math.max(0.1, input.percent / 100))
+      await setSlidingState(input.sessionID, {
+        ...current,
+        threshold,
+      })
+      Bus.publish(Event.Compacted, { sessionID: input.sessionID })
+      return {
+        percent: threshold * 100,
+        threshold,
+      }
+    },
+  )
 
   export const slide = fn(
     z.object({
@@ -231,8 +279,8 @@ export namespace SessionCompaction {
       count: z.number().int().positive().optional().default(1),
     }),
     async (input) => {
-      const session = await Session.get(input.sessionID)
-      const current = manualSlides(session)
+      const sliding = await getSlidingState(input.sessionID)
+      const current = manualSlides(sliding)
       const messages = await Session.messages({ sessionID: input.sessionID })
       const maxRemovable = Math.max(0, messages.length - MIN_KEEP_MESSAGES)
       const next = Math.min(maxRemovable, current + input.count)
@@ -255,7 +303,9 @@ export namespace SessionCompaction {
     auto: boolean
   }) {
     const { mode } = await getCompactionSettings()
-    if (mode === "sliding") {
+    const sliding = await getSlidingState(input.sessionID)
+    const effectiveMode = modeWithSlidingOverride(mode, sliding)
+    if (effectiveMode === "sliding") {
       return processSliding(input)
     }
     return processSummarize(input)
@@ -330,15 +380,15 @@ export namespace SessionCompaction {
     threshold: number
     removeMessageID?: string
   }) {
-    const session = await Session.get(input.sessionID)
+    const sliding = await getSlidingState(input.sessionID)
     const messages = input.removeMessageID
       ? input.messages.filter((msg) => msg.info.id !== input.removeMessageID)
       : input.messages
     return computeSlidingWindow({
       messages,
       model: input.model,
-      threshold: input.threshold,
-      manual: manualSlides(session),
+      threshold: slidingThreshold(sliding, input.threshold),
+      manual: manualSlides(sliding),
     })
   }
 
@@ -503,7 +553,9 @@ export namespace SessionCompaction {
     }),
     async (input) => {
       const { config, mode, threshold } = await getCompactionSettings()
-      if (mode === "sliding") {
+      const sliding = await getSlidingState(input.sessionID)
+      const effectiveMode = modeWithSlidingOverride(mode, sliding)
+      if (effectiveMode === "sliding") {
         if (config.compaction?.auto === false && input.auto) return
         const model = await Provider.getModel(input.model.providerID, input.model.modelID)
         const messages = await Session.messages({ sessionID: input.sessionID })
